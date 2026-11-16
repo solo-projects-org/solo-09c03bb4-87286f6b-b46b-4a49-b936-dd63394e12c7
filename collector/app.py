@@ -35,7 +35,9 @@ app = FastAPI(
 )
 
 storage = Storage(settings.data_dir)
-database = schema.Database(storage.db_path())
+# 启动恢复与 tmp 清理均为锁感知（LOCK_NB 非阻塞）：
+# 另一实例仍在采集/发布的任务绝不动；仅回收已退出实例的现场
+database = schema.Database(storage.db_path(), locks_dir=storage.locks_dir)
 storage.cleanup_tmp()
 
 

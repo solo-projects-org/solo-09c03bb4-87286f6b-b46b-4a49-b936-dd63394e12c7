@@ -11,6 +11,8 @@ import threading
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from .locks import TaskLockedError, task_lock
+
 # 任务生命周期
 TASK_PENDING = "PENDING"
 TASK_DOWNLOADING = "DOWNLOADING"
@@ -34,9 +36,11 @@ def utcnow() -> str:
 
 
 class Database:
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, locks_dir: Optional[str] = None) -> None:
         self.path = path
         os.makedirs(os.path.dirname(path), exist_ok=True)
+        # 任务锁目录默认与库同卷（<data_dir>/locks），与 Storage 布局一致
+        self.locks_dir = locks_dir or os.path.join(os.path.dirname(path), "locks")
         self._init_schema()
         self.recover_on_startup()
 
@@ -101,19 +105,51 @@ class Database:
 
     # ---------- 启动恢复 ----------
     def recover_on_startup(self) -> None:
-        """上次进程退出时遗留在 DOWNLOADING 的任务/版本一律回到 INTERRUPTED，
-        绝不允许重启后误报完成；锁由 flock 自动释放。"""
+        """锁感知的启动恢复，只回收“确无活跃属主”的中断现场。
+
+        - 任务锁仍被持有 → 另一实例正在采集/发布，绝不改动其任何状态；
+        - 锁可立即获得 → 属主进程已退出（flock 随进程消亡释放），把残留的
+          DOWNLOADING 归位 INTERRUPTED（绝不误报完成），分片保留供续传。
+
+        恢复只“归位”，从不登记完成：发布记录只能由正常采集流程在
+        校验通过后写入。全部写操作为锁内条件更新（WHERE state=DOWNLOADING），
+        即使与另一实例的继续采集交错，也不会按过时判断覆盖其新状态。
+        """
         conn = self._conn()
-        with conn:
-            conn.execute(
-                "UPDATE task_versions SET state=?, updated_at=? "
-                "WHERE state=?",
-                (REV_INTERRUPTED, utcnow(), REV_DOWNLOADING),
-            )
-            conn.execute(
-                "UPDATE tasks SET state=?, updated_at=? WHERE state=?",
-                (TASK_INTERRUPTED, utcnow(), TASK_DOWNLOADING),
-            )
+        task_ids = {
+            row["task_id"]
+            for row in conn.execute(
+                "SELECT DISTINCT task_id FROM task_versions WHERE state=?",
+                (REV_DOWNLOADING,),
+            ).fetchall()
+        }
+        task_ids |= {
+            row["id"]
+            for row in conn.execute(
+                "SELECT id FROM tasks WHERE state=?", (TASK_DOWNLOADING,)
+            ).fetchall()
+        }
+        for task_id in task_ids:
+            lock_path = os.path.join(self.locks_dir, f"{task_id}.lock")
+            try:
+                with task_lock(lock_path):
+                    now = utcnow()
+                    with conn:
+                        # 条件更新：若属主在锁交接间隙已正常收尾（如 PUBLISHED），
+                        # rowcount 为 0，绝不回退其状态
+                        conn.execute(
+                            "UPDATE task_versions SET state=?, instance_id=NULL, "
+                            "updated_at=? WHERE task_id=? AND state=?",
+                            (REV_INTERRUPTED, now, task_id, REV_DOWNLOADING),
+                        )
+                        conn.execute(
+                            "UPDATE tasks SET state=?, updated_at=? "
+                            "WHERE id=? AND state=?",
+                            (TASK_INTERRUPTED, now, task_id, TASK_DOWNLOADING),
+                        )
+            except TaskLockedError:
+                # 活跃实例正在处理该任务：原样保留其 DOWNLOADING 状态
+                continue
 
     # ---------- 任务 ----------
     def create_task(self, station: str, date: str) -> dict[str, Any]:

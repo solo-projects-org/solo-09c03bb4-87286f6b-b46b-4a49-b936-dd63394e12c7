@@ -6,6 +6,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY __init__.py ./collector/__init__.py
 COPY config.py ./collector/config.py
+COPY locks.py ./collector/locks.py
 COPY db.py ./collector/db.py
 COPY storage.py ./collector/storage.py
 COPY transfer.py ./collector/transfer.py

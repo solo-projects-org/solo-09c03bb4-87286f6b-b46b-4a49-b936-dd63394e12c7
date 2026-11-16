@@ -189,4 +189,54 @@ curl -sf "http://127.0.0.1:$PORT_A/tasks/$TID2/download" -o "$RUN/st02.csv"
 curl -sf "http://127.0.0.1:$PORT_SOURCE/data/ST02/2026-11-16" -o "$RUN/source-st02.csv"
 cmp "$RUN/st02.csv" "$RUN/source-st02.csv" && echo "ST02 原件一致 OK"
 
+echo; echo "== 9. 轮换重启不干扰活跃实例：B 重启期间 A 的采集/发布现场原样保留 =="
+TID4=$(curl -sf -X POST "http://127.0.0.1:$PORT_A/tasks" -H 'Content-Type: application/json' \
+  -d '{"station":"ST04","date":"2026-11-16"}' | jp "d['id']")
+curl -sf -X POST "http://127.0.0.1:$PORT_SOURCE/admin/station" -H 'Content-Type: application/json' \
+  -d '{"station":"ST04","date":"2026-11-16"}' >/dev/null
+curl -sf -X POST "http://127.0.0.1:$PORT_SOURCE/admin/delay" -H 'Content-Type: application/json' \
+  -d '{"station":"ST04","date":"2026-11-16","delay_seconds":6}' >/dev/null
+# A 后台开始采集（延迟注入使其在 B 重启期间保持 DOWNLOADING 并持锁）
+curl -s -o "$RUN/st04-a.json" -w '%{http_code}' -X POST "http://127.0.0.1:$PORT_A/tasks/$TID4/resume" > "$RUN/code-a4.txt" &
+A4_REQ_PID=$!
+for _ in $(seq 1 50); do
+  STATE=$(curl -sf "http://127.0.0.1:$PORT_A/tasks/$TID4" | jp "d['state']" || true)
+  [ "$STATE" = "DOWNLOADING" ] && break
+  sleep 0.1
+done
+echo "A 状态=$STATE（期望 DOWNLOADING）"; test "$STATE" = "DOWNLOADING"
+# 布置两类临时文件：活跃任务的“发布中”文件 + 已退出实例（无属主）的残件
+echo "publishing" > "$SHARED/tmp/$TID4-r1-99999.tmp"
+echo "stale" > "$SHARED/tmp/999999-r1-1.tmp"
+# 轮换重启 B：其启动恢复与 tmp 清理都在 A 持锁期间执行
+kill "$B_PID"; wait "$B_PID" 2>/dev/null || true
+for _ in $(seq 1 50); do
+  curl -sf -m1 "http://127.0.0.1:$PORT_B/health" >/dev/null 2>&1 || break
+  sleep 0.1
+done
+start_collector "$PORT_B" collector-b-rotate >"$RUN/collector-b-rotate.log" 2>&1 &
+B_PID=$!
+wait_health "http://127.0.0.1:$PORT_B/health"
+NEW_B=$(curl -sf "http://127.0.0.1:$PORT_B/health" | jp "d['instance_id']")
+echo "B 已轮换为新进程：$NEW_B（确认是新进程）"; test "$NEW_B" = "collector-b-rotate"
+# B 的启动恢复不得改动 A 的任务状态，不得清理 A 的发布临时文件
+STATE=$(curl -sf "http://127.0.0.1:$PORT_B/tasks/$TID4" | jp "d['state']")
+echo "B 启动后 A 的任务状态=$STATE（期望仍为 DOWNLOADING）"; test "$STATE" = "DOWNLOADING"
+test -f "$SHARED/tmp/$TID4-r1-99999.tmp" && echo "活跃实例的发布临时文件未被清理 OK"
+test ! -f "$SHARED/tmp/999999-r1-1.tmp" && echo "已退出实例的发布残件已被自动清理 OK"
+# 启动恢复不等待活跃采集结束，期间已发布原件可下载、进度可查
+curl -sf "http://127.0.0.1:$PORT_B/tasks/$TID/download" -o "$RUN/during-rotate.csv"
+cmp "$RUN/during-rotate.csv" "$RUN/r3.csv" && echo "B 轮换期间已发布原件下载正常 OK"
+curl -sf "http://127.0.0.1:$PORT_B/tasks/$TID4" | jp "d['active_version']['instance_id']"
+# 等 A 完成采集并发布（A 全程未受 B 重启影响）
+wait "$A4_REQ_PID"; test "$(cat "$RUN/code-a4.txt")" = "200"
+DETAIL=$(curl -sf "http://127.0.0.1:$PORT_A/tasks/$TID4")
+echo "$DETAIL" | "$PY" -c "import sys,json;d=json.load(sys.stdin);assert d['state']=='PUBLISHED';print('A 完成采集并发布 OK')"
+curl -sf "http://127.0.0.1:$PORT_A/tasks/$TID4/download" -o "$RUN/st04.csv"
+curl -sf "http://127.0.0.1:$PORT_SOURCE/data/ST04/2026-11-16" -o "$RUN/source-st04.csv"
+cmp "$RUN/st04.csv" "$RUN/source-st04.csv" && echo "ST04 原件与源站字节一致 OK"
+# 活跃期残留的临时文件在下一次续传（持锁）时被回收
+curl -sf -X POST "http://127.0.0.1:$PORT_A/tasks/$TID4/resume" >/dev/null
+test ! -f "$SHARED/tmp/$TID4-r1-99999.tmp" && echo "续传持锁后残件回收 OK"
+
 echo; echo "全部端到端检查通过 ✔  运行目录：$RUN"

@@ -10,17 +10,15 @@
 """
 from __future__ import annotations
 
-import contextlib
-import fcntl
 import hashlib
 import os
-from dataclasses import dataclass
-from typing import Any, Iterator
+from typing import Any
 
 import httpx
 
 from . import db as schema
 from .config import Settings
+from .locks import LockHandle, TaskLockedError, task_lock  # noqa: F401  (兼容旧导入)
 from .storage import Storage
 
 
@@ -30,33 +28,6 @@ class TransferError(Exception):
 
 class VerificationError(Exception):
     """原件与清单不一致（长度/摘要/ETag），本次分片作废重取。"""
-
-
-class TaskLockedError(Exception):
-    """另一实例/线程正在采集该任务。"""
-
-
-@dataclass
-class LockHandle:
-    fd: int
-    path: str
-
-
-@contextlib.contextmanager
-def task_lock(lock_path: str) -> Iterator[LockHandle]:
-    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
-    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
-    try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            os.close(fd)
-            raise TaskLockedError(lock_path) from exc
-        yield LockHandle(fd=fd, path=lock_path)
-    finally:
-        with contextlib.suppress(OSError):
-            fcntl.flock(fd, fcntl.LOCK_UN)
-            os.close(fd)
 
 
 def fetch_manifest(client: httpx.Client, settings: Settings,
@@ -193,6 +164,9 @@ def run_resume(
     lock_path = storage.lock_path(str(task_id))
 
     with task_lock(lock_path):
+        # 持锁后先清掉上一任属主（已退出实例）残留的发布临时文件；
+        # 创建与清理同锁，绝不会删到活跃实例的文件
+        storage.cleanup_tmp_for_task(str(task_id))
         database.mark_task_downloading(task_id, settings.instance_id)
         try:
             with httpx.Client(

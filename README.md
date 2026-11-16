@@ -20,9 +20,9 @@ docker compose
 
 ```
 collector.db                 SQLite（WAL 模式）
-locks/<task_id>.lock         跨实例 fcntl.flock 互斥锁
+locks/<task_id>.lock         跨实例 fcntl.flock 互斥锁（兼作“活跃属主”判据）
 parts/<task_id>/r<rev>.part  未完成分片，按修订号隔离，流式追加
-tmp/                         发布临时文件（原子 replace 前，启动即清理残留）
+tmp/                         发布临时文件（原子 replace 前；启动时仅清理无属主残留）
 published/                   已发布、可下载的一致原件（硬链接 + 原子 replace）
 ```
 
@@ -38,7 +38,8 @@ published/                   已发布、可下载的一致原件（硬链接 + 
 | 原子发布，杜绝半件 | 硬链接到 tmp 再 `os.replace` 原子替换并 fsync 目录；下载接口仅暴露 `publishes` 中登记的文件 |
 | 旧修订晚完成不回退 | 发布为条件更新；任务当前版只前进不后退，旧修订即使晚完成也仅留存、不覆盖当前版 |
 | 两实例并发继续 | 每任务 `flock(LOCK_EX|LOCK_NB)`，抢锁失败立即返回 `409`，不存在交错写入 |
-| 写文件/登记发布时退出 | 启动恢复把残留 `DOWNLOADING` 归位 `INTERRUPTED`（绝不误报完成）；tmp 残留启动清理；发布条件更新防重复登记 |
+| 写文件/登记发布时退出 | 启动恢复把**无属主**的残留 `DOWNLOADING` 归位 `INTERRUPTED`（绝不误报完成）；无属主 tmp 残留启动清理；发布条件更新防重复登记 |
+| 轮换重启不干扰活跃实例 | 启动恢复/tmp 清理均以 `LOCK_NB` 试探任务锁：锁被持有＝另一实例正在采集/发布，**不改其状态、不删其文件**；锁可获得＝属主已退出，安全回收。恢复写库为锁内条件更新，与继续采集交错也不会按过时判断落笔；恢复从不登记完成记录 |
 | 新版完成前旧版供数 | 已发布文件与 `publishes` 记录在新版采集期间保持不动，下载始终返回最新已发布修订 |
 
 ## API（采集实例，Swagger：`http://localhost:8001/docs`）
@@ -94,8 +95,8 @@ PYTHON=/path/to/venv/bin/python tests/e2e_demo.sh
 ## 测试
 
 ```bash
-python -m pytest tests/          # 18 个单元/API 测试（MockTransport 模拟源站）
-tests/e2e_demo.sh                # 真实 HTTP 三进程端到端：续传/换版/并发/恢复/忽略 Range
+python -m pytest tests/          # 23 个单元/API 测试（MockTransport 模拟源站）
+tests/e2e_demo.sh                # 真实 HTTP 三进程端到端：续传/换版/并发/恢复/忽略 Range/轮换重启
 ```
 
 ## 状态语义

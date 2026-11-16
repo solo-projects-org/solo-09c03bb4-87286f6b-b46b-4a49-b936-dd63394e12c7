@@ -1,4 +1,4 @@
-"""并发与崩溃安全：双实例锁、重启恢复、发布原子性、下载防半件。"""
+"""并发与崩溃安全：双实例锁、锁感知启动恢复、发布原子性、下载防半件。"""
 from __future__ import annotations
 
 import os
@@ -82,10 +82,10 @@ def test_restart_recovers_downloading_state_to_interrupted(env):
 
 
 def test_tmp_leftover_cleaned_on_startup(env):
-    leftover = os.path.join(env.storage.tmp_dir, "stale.tmp")
+    leftover = env.storage.tmp_path(str(env.task_id), 1)
     with open(leftover, "wb") as fh:
         fh.write(b"x")
-    # 应用启动流程中的清理动作
+    # 应用启动流程中的清理动作（无活跃属主，残件清除）
     env.storage.cleanup_tmp()
     assert not os.path.exists(leftover)
 
@@ -118,3 +118,146 @@ def test_publish_is_idempotent_under_repeated_call(env):
     ).fetchone()[0]
     conn.close()
     assert n == 1
+
+
+# ---------- 轮换重启：锁感知启动恢复 ----------
+
+def _force_downloading_state(env) -> None:
+    """把任务/版本拨到 DOWNLOADING，模拟实例正在采集/发布的瞬间。"""
+    import sqlite3
+    conn = sqlite3.connect(env.storage.db_path())
+    conn.execute(
+        f"UPDATE tasks SET state='{schema.TASK_DOWNLOADING}' WHERE id=?",
+        (env.task_id,),
+    )
+    conn.execute(
+        f"UPDATE task_versions SET state='{schema.REV_DOWNLOADING}' WHERE task_id=?",
+        (env.task_id,),
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_startup_recovery_skips_locked_task_and_recovers_after_exit(env):
+    # 先制造一次中断，留下分片
+    env.source.drop_after = 500
+    with pytest.raises(Exception):
+        env.resume()
+    part = env.part_path(1)
+    saved = os.path.getsize(part)
+    assert saved > 0
+    _force_downloading_state(env)
+
+    lock_path = env.storage.lock_path(str(env.task_id))
+    with task_lock(lock_path):
+        # 实例 B 启动：另一实例仍持锁采集，恢复绝不动其状态
+        fresh_db = schema.Database(env.storage.db_path(), locks_dir=env.storage.locks_dir)
+        detail = fresh_db.task_detail(env.task_id)
+        assert detail["state"] == schema.TASK_DOWNLOADING
+        assert detail["active_version"]["state"] == schema.REV_DOWNLOADING
+
+    # 属主退出（锁随进程消亡释放）后再启动：现场归位 INTERRUPTED，分片保留
+    fresh_db2 = schema.Database(env.storage.db_path(), locks_dir=env.storage.locks_dir)
+    detail = fresh_db2.task_detail(env.task_id)
+    assert detail["state"] == schema.TASK_INTERRUPTED
+    assert detail["active_version"]["state"] == schema.REV_INTERRUPTED
+    assert os.path.getsize(part) == saved
+    # 恢复后可续传完成
+    detail = run_resume(fresh_db2, env.storage, env.settings, env.task_id)
+    assert detail["state"] == schema.TASK_PUBLISHED
+
+
+def test_cleanup_tmp_skips_locked_task_and_cleans_orphans(env):
+    # 活跃任务的发布临时文件（另一实例正在发布）
+    active_tmp = env.storage.tmp_path(str(env.task_id), 1)
+    with open(active_tmp, "wb") as fh:
+        fh.write(b"publishing")
+    # 已退出实例的残件（无属主任务）
+    orphan_tmp = env.storage.tmp_path("999999", 3)
+    with open(orphan_tmp, "wb") as fh:
+        fh.write(b"stale")
+
+    lock_path = env.storage.lock_path(str(env.task_id))
+    with task_lock(lock_path):
+        env.storage.cleanup_tmp()
+        assert os.path.exists(active_tmp)       # 活跃实例的文件未被触碰
+        assert not os.path.exists(orphan_tmp)   # 无属主残件被清理
+
+    # 锁释放后再清理：残件可回收
+    env.storage.cleanup_tmp()
+    assert not os.path.exists(active_tmp)
+
+
+def test_publish_in_progress_survives_other_instance_startup(env):
+    """Bug 现场：A 已收齐、正在发布（tmp 已 link），B 启动不得删其临时文件、
+    不得改其任务状态，A 随后的原子替换必须成功。"""
+    env.source.drop_after = 400
+    with pytest.raises(Exception):
+        env.resume()
+    # 补全分片为完整一致原件（模拟 A 已收齐）
+    blob = env.source.blobs[1]
+    part = env.part_path(1)
+    with open(part, "wb") as fh:
+        fh.write(blob)
+    _force_downloading_state(env)
+
+    lock_path = env.storage.lock_path(str(env.task_id))
+    with task_lock(lock_path):
+        # A 发布中：硬链接出临时文件，尚未 os.replace
+        tmp = env.storage.tmp_path(str(env.task_id), 1)
+        os.link(part, tmp)
+
+        # 实例 B 启动：恢复 + 清理都不得触碰活跃任务
+        fresh_db = schema.Database(env.storage.db_path(), locks_dir=env.storage.locks_dir)
+        env.storage.cleanup_tmp()
+        assert os.path.exists(tmp), "活跃实例的发布临时文件被误删"
+        detail = fresh_db.task_detail(env.task_id)
+        assert detail["state"] == schema.TASK_DOWNLOADING
+        assert detail["active_version"]["state"] == schema.REV_DOWNLOADING
+
+        # A 继续完成发布：原子替换不再报错
+        final = env.storage.final_path("ST01", "2026-11-16", 1)
+        os.replace(tmp, final)
+        assert os.path.isfile(final)
+
+
+def test_dead_instance_publish_leftover_cleaned_part_kept_no_fake_completion(env):
+    """已退出实例的发布残件：tmp 自动清理、分片保留、状态归位 INTERRUPTED，
+    恢复绝不把“看似收齐”的版本登记为完成（无 publishes 记录）。"""
+    blob = env.source.blobs[1]
+    env.source.drop_after = 400
+    with pytest.raises(Exception):
+        env.resume()  # 建立版本行与分片
+    part = env.part_path(1)
+    with open(part, "wb") as fh:
+        fh.write(blob)  # 完整分片：属主在发布前一刻退出
+    _force_downloading_state(env)
+    stale_tmp = env.storage.tmp_path(str(env.task_id), 1)
+    os.link(part, stale_tmp)
+
+    # 实例 B 启动（属主已退出，锁可立即获得）
+    fresh_db = schema.Database(env.storage.db_path(), locks_dir=env.storage.locks_dir)
+    env.storage.cleanup_tmp()
+
+    assert not os.path.exists(stale_tmp), "已退出实例的发布残件未清理"
+    assert os.path.getsize(part) == len(blob), "分片必须保留供续传"
+    detail = fresh_db.task_detail(env.task_id)
+    assert detail["state"] == schema.TASK_INTERRUPTED
+    assert detail["active_version"]["state"] == schema.REV_INTERRUPTED
+    assert detail["latest_published"] is None, "恢复不得登记缺件的完成记录"
+
+    # 续传走正常流程：重新校验后发布，字节与源站一致
+    detail = run_resume(fresh_db, env.storage, env.settings, env.task_id)
+    assert detail["state"] == schema.TASK_PUBLISHED
+    with open(detail["latest_published"]["file_path"], "rb") as fh:
+        assert fh.read() == blob
+
+
+def test_resume_cleans_stale_publish_leftover_under_lock(env):
+    """续传持锁后先清理本任务的发布残件（已退出实例遗留），不影响正常发布。"""
+    stale_tmp = env.storage.tmp_path(str(env.task_id), 1)
+    with open(stale_tmp, "wb") as fh:
+        fh.write(b"leftover-from-dead-instance")
+    detail = env.resume()
+    assert detail["state"] == schema.TASK_PUBLISHED
+    assert not os.path.exists(stale_tmp)

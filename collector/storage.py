@@ -6,10 +6,17 @@ DATA_DIR/
 ├── parts/<task_id>/r<rev>.part # 未完成分片（按修订号隔离）
 ├── tmp/...                     # 发布临时文件（原子 replace 前）
 └── published/...               # 已发布、可下载的一致原件
+
+清理纪律：发布临时文件只在“创建”（publish_atomic，持任务锁）与
+“清理”（cleanup_tmp / cleanup_tmp_for_task，同样持任务锁）两侧都受锁保护，
+因此恢复检查与继续采集交错时，绝不会按过时判断删掉另一实例刚建的新文件。
+分片（parts/）不属于清理范围，一律保留供断点续传。
 """
 from __future__ import annotations
 
 import os
+
+from .locks import TaskLockedError, task_lock
 
 
 class Storage:
@@ -44,8 +51,42 @@ class Storage:
         return os.path.join(self.tmp_dir, f"{task_id}-r{revision}-{os.getpid()}.tmp")
 
     def cleanup_tmp(self) -> None:
-        """启动时清理上次崩溃残留的发布临时文件（正式文件不受影响）。"""
-        for name in os.listdir(self.tmp_dir):
+        """启动时清理发布临时文件残件（非阻塞，不等待活跃采集结束）。
+
+        逐任务试探任务锁：
+        - 锁被持有 → 另一实例正在采集/发布该任务，其临时文件绝不动；
+        - 锁可立即获得 → 属主已退出，残件在锁内删除（创建与删除同锁，
+          不会误删活跃实例刚建立的文件）。
+        """
+        try:
+            names = os.listdir(self.tmp_dir)
+        except FileNotFoundError:
+            return
+        task_ids = {
+            task_id
+            for name in names
+            if (task_id := tmp_task_id(name)) is not None
+        }
+        for task_id in task_ids:
+            try:
+                with task_lock(self.lock_path(task_id)):
+                    self._unlink_tmp_locked(task_id)
+            except TaskLockedError:
+                continue
+
+    def cleanup_tmp_for_task(self, task_id: str) -> None:
+        """清理指定任务的发布临时残件。调用方必须已持有该任务锁。"""
+        self._unlink_tmp_locked(task_id)
+
+    def _unlink_tmp_locked(self, task_id: str) -> None:
+        # 在锁内重新列目录：锁保证此刻没有属主在创建该任务的新临时文件
+        try:
+            names = os.listdir(self.tmp_dir)
+        except FileNotFoundError:
+            return
+        for name in names:
+            if tmp_task_id(name) != task_id:
+                continue
             try:
                 os.unlink(os.path.join(self.tmp_dir, name))
             except FileNotFoundError:
@@ -61,6 +102,14 @@ class Storage:
         os.link(part, tmp)
         os.replace(tmp, final)
         _fsync_dir(self.published_dir)
+
+
+def tmp_task_id(name: str) -> str | None:
+    """从发布临时文件名 '<task_id>-r<rev>-<pid>.tmp' 解析任务 ID；不匹配返回 None。"""
+    if not name.endswith(".tmp"):
+        return None
+    head, _, _ = name.partition("-")
+    return head if head.isdigit() else None
 
 
 def _safe(value: str) -> str:
